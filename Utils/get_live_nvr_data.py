@@ -1,5 +1,5 @@
 import cv2
-from Interfaces.camera_retrieval import CameraRetrievalProtocol
+from Interfaces.camera_retrieval_interface import CameraRetrievalProtocol
 from typing import Any, Optional
 
 class HikvisionCameraRetrieval:
