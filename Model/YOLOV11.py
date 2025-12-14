@@ -4,9 +4,9 @@ from Utils.dataset_loader import RobustDatasetLoader
 from Utils.yolo_dataset import YOLOFolderDataset
 from typing import Any, Tuple
 
-_path_to_train = "Data/Dataset/train"
-_path_to_val = "Data/Dataset/valid"
-_path_to_test = "Data/Dataset/test"
+_path_to_train = "../Data/Dataset/train"
+_path_to_val = "../Data/Dataset/valid"
+_path_to_test = "../Data/Dataset/test"
 
 def training_pipeline(device: torch.device, batch_size: int = 16, workers: int = 16):
     """

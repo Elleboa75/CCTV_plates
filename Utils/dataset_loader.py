@@ -3,6 +3,9 @@ from typing import List, Union, Any, Optional, Tuple
 from torch.utils.data import random_split, Dataset
 import os
 
+from Utils.yolo_dataset import YOLOFolderDataset
+
+
 class RobustDatasetLoader():
     def __init__(self,
                  source: Union[str, List[str]],
@@ -80,4 +83,4 @@ class RobustDatasetLoader():
         """
         if not os.path.exists(path):
             raise FileNotFoundError(f"File {path} not found.")
-        return
+        return YOLOFolderDataset(root = path, transform = None)
