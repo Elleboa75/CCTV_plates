@@ -80,12 +80,14 @@ def train_one_epoch(loader, model, optimizer, scaler, loss_fn):
             preds = model(batch_dict["img"])
             loss, loss_items = loss_fn(preds, batch_dict)
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss.sum()).backward()
         scaler.step(optimizer)
         scaler.update()
 
-        mean_loss.append(loss.item())
-        loop.set_postfix(loss = loss.item())
+        loss_value = loss.sum().item()
+        mean_loss.append(loss_value)
+        loop.set_postfix(loss = loss_value)
+
     return sum(mean_loss) / len(mean_loss)
 
 def evaluate(loader, model, loss_fn):
@@ -100,7 +102,8 @@ def evaluate(loader, model, loss_fn):
             with autocast(device_type = 'cuda'):
                 preds = model(batch_dict["img"])
                 loss, _ = loss_fn(preds, batch_dict)
-            mean_loss.append(loss.item())
+            loss_value = loss.sum().item()
+            mean_loss.append(loss_value)
 
     return sum(mean_loss) / len(mean_loss)
 
