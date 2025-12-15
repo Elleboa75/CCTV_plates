@@ -3,80 +3,36 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torchgen import model
 from tqdm import tqdm
-import numpy as np
 from YOLOV11 import training_pipeline
-import math
-from typing import Tuple, List, Dict, Any, Optional
+from typing import List, Dict, Any
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils.loss import v8DetectionLoss
 from types import SimpleNamespace
+from yolo_helpers import non_max_suppression, xywh2xyxy, preprocess_batch, load_model_from_file
+from ultralytics.utils.metrics import box_iou
+import os
 
 # HYPERPARAMETERS
-LEARNING_RATE = 1e-4
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 16
-EPOCHS = 50
-WEIGHT_DECAY = 1e-4
-CFG_FILE = "yolo11n.yaml"
+LEARNING_RATE: float = 1e-4
+DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE: int = 16
+EPOCHS: int = 50
+WEIGHT_DECAY: float = 1e-4
+CFG_FILE: str = "yolo11n.yaml"
+TRAINING_MODE: bool = False
+MODEL_PATH: str = "best_model.pth"
 
-
-def preprocess_batch(images: torch.Tensor, targets: List[torch.Tensor]) -> Dict[str, Any]:
-    """
-    :Prepares the batch for the YOLOv8/v11 Loss function.
-
-    :param images: The batch of images (B, C, H, W)
-    :param targets: A list where each element is a Tensor of shape (Num_Boxes, 5) for that image.
-    :return: A dictionary matching the keys expected by v8DetectionLoss.
-    """
-    all_idx: List[torch.Tensor] = []
-    all_classes: List[torch.Tensor] = []
-    all_bboxes: List[torch.Tensor] = []
-
-    for idx, target in enumerate(targets):
-        if target is None or len(target) == 0:
-            continue
-
-        n_boxes: int = target.shape[0]
-
-        batch_index: torch.Tensor = torch.full((n_boxes, 1), idx, dtype = torch.long, device = DEVICE)
-
-        all_idx.append(batch_index)
-        all_classes.append(target[:, 0:1].to(DEVICE))
-        all_bboxes.append(target[:, 1:5].to(DEVICE))
-
-    batch_idx: torch.Tensor
-    batch_class: torch.Tensor
-    batch_bboxes: torch.Tensor
-
-    if len(all_idx) > 0:
-        batch_idx = torch.cat(all_idx, dim = 0)
-        batch_class = torch.cat(all_classes, dim = 0)
-        batch_bboxes = torch.cat(all_bboxes, dim = 0)
-    else:
-        batch_idx = torch.zeros((0, 1), device = DEVICE)
-        batch_class = torch.zeros((0, 1), device = DEVICE)
-        batch_bboxes = torch.zeros((0, 4), device = DEVICE)
-
-    return {
-        "img": images.to(DEVICE),
-        "batch_idx": batch_idx.view(-1),
-        "cls": batch_class.view(-1, 1),
-        "bboxes": batch_bboxes
-    }
-
-def train_one_epoch(loader, model, optimizer, scaler, loss_fn):
+def train_one_epoch(loader, model, optimizer, scaler, loss_fn) -> float:
     model.train()
     loop = tqdm(loader, leave = True)
 
     mean_loss: List[float] = []
 
     for batch_idx, (images, targets) in enumerate(loop):
-
-        batch_dict = preprocess_batch(images, targets)
+        batch_dict = preprocess_batch(images, targets, DEVICE)
         optimizer.zero_grad()
 
         with autocast(device_type = 'cuda'):
-
             preds = model(batch_dict["img"])
             loss, loss_items = loss_fn(preds, batch_dict)
 
@@ -97,7 +53,7 @@ def evaluate(loader, model, loss_fn):
 
     with torch.no_grad():
         for images, targets in loop:
-            batch_dict = preprocess_batch(images, targets)
+            batch_dict = preprocess_batch(images, targets, DEVICE)
 
             with autocast(device_type = 'cuda'):
                 preds = model(batch_dict["img"])
@@ -107,53 +63,141 @@ def evaluate(loader, model, loss_fn):
 
     return sum(mean_loss) / len(mean_loss)
 
-def main():
+def test(loader, model, loss_fn):
+    model.eval()
+    loop = tqdm(loader, desc = "Testing", leave = True)
+
+    mean_loss = []
+    correct_detections = 0
+    total_ground_truths = 0
+    total_predictions = 0
+
+    with torch.no_grad():
+        for images, targets in loop:
+            batch_dict = preprocess_batch(images, targets, DEVICE)
+
+            with autocast(device_type = 'cuda'):
+                preds = model(batch_dict["img"])
+                loss, _ = loss_fn(preds, batch_dict)
+            loss_value = loss.sum().item()
+            mean_loss.append(loss_value)
+            pred_list = non_max_suppression(preds, conf_thres = 0.25, iou_thres = 0.6)
+
+            for idx, pred in enumerate(pred_list):
+
+                mask = batch_dict['batch_idx'] == idx
+                boxes = batch_dict['bboxes'][mask]
+
+                if len(boxes) == 0:
+                    total_predictions += len(pred)
+                    continue
+
+                boxes = xywh2xyxy(boxes)
+
+                _, _, h, w = images.shape
+                boxes[:, 0] *= w
+                boxes[:, 2] *= w
+                boxes[:, 1] *= h
+                boxes[:, 3] *= h
+
+                total_ground_truths += len(boxes)
+                total_predictions += len(pred)
+
+                if len(pred) == 0:
+                    continue
+
+                iou_matrix = box_iou(pred[:, :4], boxes)
+
+                # Check if any prediction overlaps a GT by > 50%
+                # .max(dim=0) checks "For each GT, what was the best prediction IoU?"
+                max_ious, _ = iou_matrix.max(dim = 0)
+
+                # Count how many GTs were "found" (IoU > 0.5)
+                detected_count = (max_ious > 0.5).sum().item()
+                correct_detections += detected_count
+
+    # Recall = Found / Total Real Plates
+    recall = correct_detections / (total_ground_truths + 1e-6)
+
+    # Precision = Found / Total Guesses
+    precision = correct_detections / (total_predictions + 1e-6)
+
+    avg_loss = sum(mean_loss) / len(mean_loss) if mean_loss else 0.0
+
+    print(f"\nTest Results:")
+    print(f"  Loss: {avg_loss:.4f}")
+    print(f"  Recall (Accuracy): {recall:.2%}")
+    print(f"  Precision: {precision:.2%}")
+
+    return recall
+
+def main() -> None:
     train_loader, val_loader, test_loader = training_pipeline(
         device = DEVICE,
         batch_size = BATCH_SIZE,
         workers = 16,
     )
-    print(f"Initializing model {CFG_FILE}...")
-    model = (DetectionModel(CFG_FILE, nc = 1))
-    model.to(DEVICE)
+    if TRAINING_MODE:
+        print(f"Initializing model {CFG_FILE}...\n")
+        model = (DetectionModel(CFG_FILE, nc = 1))
+        model.to(DEVICE)
 
-    #Default Ultralytics values
-    model.args = SimpleNamespace(
-        box = 7.5,  # Box loss gain
-        cls = 0.5,  # Class loss gain (scaled by pixel count)
-        dfl = 1.5,  # Distribution Focal Loss gain
-        pose = 12.0,  # (Not used for detection, but required to prevent crash)
-        kobj = 1.0,  # (Not used, but required)
+        #Default Ultralytics values
+        model.args = SimpleNamespace(
+            box = 7.5,  # Box loss gain
+            cls = 0.5,  # Class loss gain (scaled by pixel count)
+            dfl = 1.5,  # Distribution Focal Loss gain
+            pose = 12.0,  # (Not used for detection, but required to prevent crash)
+            kobj = 1.0,  # (Not used, but required)
 
-        # Training settings the loss might peek at
-        overlap_mask = True,
-        mask_ratio = 4,
-        dropout = 0.0,
-        val = False
-    )
+            # Training settings the loss might peek at
+            overlap_mask = True,
+            mask_ratio = 4,
+            dropout = 0.0,
+            val = False
+        )
 
-    criterion = v8DetectionLoss(model)
+        criterion = v8DetectionLoss(model)
 
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr = LEARNING_RATE,
-        weight_decay = WEIGHT_DECAY
-    )
-    scaler = GradScaler()
-    best_val_loss = float("inf")
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr = LEARNING_RATE,
+            weight_decay = WEIGHT_DECAY
+        )
+        scaler = GradScaler()
+        best_val_loss = float("inf")
+        best_model = None
 
-    for epoch in range(EPOCHS):
-        print(f"Epoch {epoch + 1}/{EPOCHS}\n")
+        for epoch in range(EPOCHS):
+            print(f"Epoch {epoch + 1}/{EPOCHS}\n")
 
-        train_loss = train_one_epoch(train_loader, model, optimizer, scaler, criterion)
-        val_loss = evaluate(val_loader, model, criterion)
+            train_loss = train_one_epoch(train_loader, model, optimizer, scaler, criterion)
+            val_loss = evaluate(val_loader, model, criterion)
 
-        print(f"Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f}")
+            print(f"Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f}\n")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), f"best_model.pth")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), MODEL_PATH)
+                best_model = model
+    else:
+        if os.path.exists(MODEL_PATH):
+            best_model = load_model_from_file(MODEL_PATH, DEVICE, CFG_FILE)
+            criterion = v8DetectionLoss(best_model)
+        else:
+            print(f"Error: Model file {MODEL_PATH} not found. Cannot test.")
+            return
 
+    if best_model is not None:
+        print("\nRunning Final Test on Best Model...")
+        try:
+            best_model.eval()
+            test_performance = test(test_loader, best_model, criterion)
+            print(f"\nFinal Test Recall: {test_performance:.2%}")
+        except Exception as e:
+            print(f"\nError during testing: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main()

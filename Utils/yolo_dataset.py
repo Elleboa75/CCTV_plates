@@ -1,6 +1,5 @@
 import os
 import glob
-import numpy as np
 import cv2
 import numpy as np
 from torch.utils.data import Dataset
